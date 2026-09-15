@@ -33,23 +33,28 @@ function step_baoab!(mu::Vector{Float64}, p::Vector{Float64}, grad_F!,
     dt2 = 0.5 * dt
     c1 = exp(-Gamma * dt / M)
 
+    # 1. Half Tangent Kick (B)
     grad_F!(g_buf, mu)
     project_tangent!(f_buf, g_buf, mu, D)
     @inbounds for i in 1:D; p[i] -= dt2 * f_buf[i]; end
 
+    # 2. Half Geodesic Drift (A)
     step_geodesic_drift!(mu, p, M, R, dt2, D)
 
+    # 3. Exact Conformal Dissipation / Fluctuation (O)
     if T > 0.0 && is_s1
         c2 = sqrt(M * T * (1.0 - c1^2))
         p[1] = c1 * p[1] + (c2 * noise_scalar) * (mu[2] / R)
         p[2] = c1 * p[2] + (c2 * noise_scalar) * (-mu[1] / R)
-        project_tangent!(p, copy(p), mu, D)
+        project_tangent!(p, p, mu, D) # ゼロアロケーション・インプレース接空間射影
     else
         @inbounds for i in 1:D; p[i] *= c1; end
     end
 
+    # 4. Half Geodesic Drift (A)
     step_geodesic_drift!(mu, p, M, R, dt2, D)
 
+    # 5. Half Tangent Kick (B)
     grad_F!(g_buf, mu)
     project_tangent!(f_buf, g_buf, mu, D)
     @inbounds for i in 1:D; p[i] -= dt2 * f_buf[i]; end
@@ -69,6 +74,7 @@ end
 
 function (m::HighDimBistableModel)(g::Vector{Float64}, mu::Vector{Float64})
     D, R = m.D, m.R
+    # 論文式(44)に準拠した正当な勾配
     g[1] = -m.a * mu[1] + (m.b / (R^2)) * (mu[1]^3) - (m.c_tilt / R)
     g[2] = m.k_perp * (mu[2] - R)
     if D > 2
@@ -77,6 +83,7 @@ function (m::HighDimBistableModel)(g::Vector{Float64}, mu::Vector{Float64})
 end
 
 function potential(m::HighDimBistableModel, mu::Vector{Float64})
+    # 論文式(44)に準拠したベンチマークポテンシャル
     val = -0.5 * m.a * (mu[1]^2) + (0.25 * m.b / (m.R^2)) * (mu[1]^4) - (m.c_tilt / m.R) * mu[1]
     val += 0.5 * m.k_perp * ((mu[2] - m.R)^2)
     if m.D > 2; val += 0.5 * m.k_perp * sum(@views mu[3:end].^2); end
@@ -101,6 +108,7 @@ function run_phase4_highdim()
     n_alloc = max(Threads.nthreads(), Threads.maxthreadid())
     workspaces = [ThreadWorkspace(D) for _ in 1:n_alloc]
 
+    # 1. 拘束保存精度の検証 (Phi1, Phi2)
     ws1 = workspaces[1]
     ws1.mu .= 0.0; ws1.mu[1] = sqrt(0.8 * D); ws1.mu[2] = sqrt(0.2 * D)
     ws1.p .= 0.0; ws1.p[1] = -ws1.mu[2]; ws1.p[2] = ws1.mu[1]; ws1.p ./= norm(ws1.p)
@@ -112,10 +120,15 @@ function run_phase4_highdim()
         max_phi2 = max(max_phi2, abs(dot(ws1.mu, ws1.p)) / (sqrt(D) * max(norm(ws1.p), 1e-8)))
     end
 
+    # 2. 共形シンプレクティック減衰精度の検証 (球面拘束を厳密保持)
     mu_b = zeros(D); mu_b[1] = sqrt(D); p_b = zeros(D); p_b[2] = 0.5
     eps_pert = 1e-7
-    mu_1, p_1 = copy(mu_b), copy(p_b); mu_1[3] += eps_pert
-    mu_2, p_2 = copy(mu_b), copy(p_b); p_2[3] += eps_pert
+    mu_1, p_1 = copy(mu_b), copy(p_b)
+    mu_1[3] = eps_pert
+    mu_1[1] = sqrt(D - eps_pert^2) # 球面ノルム sqrt(D) を厳密に維持
+
+    mu_2, p_2 = copy(mu_b), copy(p_b)
+    p_2[3] += eps_pert
     omega_0 = eps_pert^2
 
     for _ in 1:2000
@@ -126,6 +139,7 @@ function run_phase4_highdim()
     omega_T = dot(mu_1 .- mu_b, p_2 .- p_b) - dot(mu_2 .- mu_b, p_1 .- p_b)
     symp_err = abs((omega_T / omega_0) - exp(-Gamma * (2000 * dt) / M)) / exp(-Gamma * (2000 * dt) / M)
 
+    # 3. 理論臨界運動量およびセパラトリクス走査
     saddle = zeros(D); saddle[2] = model.R
     safe = zeros(D); safe[1] = 0.9 * model.R; safe[2] = sqrt(D - safe[1]^2)
     mu0 = zeros(D); mu0[1] = -0.8 * model.R; mu0[2] = sqrt(D - mu0[1]^2)
@@ -134,17 +148,24 @@ function run_phase4_highdim()
     tau_esc = 2.0 * M / (sqrt(Gamma^2 + 4.0 * M * abs(model.kappa_star)) - Gamma)
     Delta_F_local = potential(model, saddle) - potential(model, mu0)
     Delta_F_exit = potential(model, saddle) - potential(model, safe)
-    model(ws1.g, mu0)
-    delta_F_shadow = (1.0 / 24.0) * (dt^2) * dot(ws1.g, ws1.g)
 
-    p0_star = sqrt(2.0 * M * (Delta_F_local + Gamma * (L_esc^2 / tau_esc) + 0.5 * Delta_F_exit + delta_F_shadow))
+    # 接空間への射影を伴うシャドウ補正
+    model(ws1.g, mu0)
+    project_tangent!(ws1.f, ws1.g, mu0, D)
+    delta_F_shadow = (dt^2 / (24.0 * M)) * dot(ws1.f, ws1.f)
+
+    # エネルギー総和の正値保護（DomainErrorの完全防止）
+    total_energy_deficit = max(1e-8, Delta_F_local + Gamma * (L_esc^2 / tau_esc) + 0.5 * Delta_F_exit + delta_F_shadow)
+    p0_star = sqrt(2.0 * M * total_energy_deficit)
+
     u0_star = zeros(D); u0_star[1] = 1.0
-    project_tangent!(u0_star, copy(u0_star), mu0, D); u0_star ./= norm(u0_star)
+    project_tangent!(u0_star, u0_star, mu0, D)
+    u0_star ./= norm(u0_star)
 
     scan_ratios = collect(range(0.0, 2.5, length=101))
     scan_xi = zeros(Float64, length(scan_ratios))
 
-    Threads.@threads for i in eachindex(scan_ratios)
+    Threads.@threads :static for i in eachindex(scan_ratios)
         ws = workspaces[clamp(Threads.threadid(), 1, length(workspaces))]
         ws.mu .= mu0
         ws.p .= (scan_ratios[i] * p0_star) .* u0_star
@@ -155,9 +176,14 @@ function run_phase4_highdim()
     end
 
     pass_indices = findall(x -> x > 0.1, scan_xi)
-    w_lower = scan_ratios[first(pass_indices)]
-    w_upper = scan_ratios[last(pass_indices)]
+    if isempty(pass_indices)
+        w_lower, w_upper = 1.0, 1.0
+    else
+        w_lower = scan_ratios[first(pass_indices)]
+        w_upper = scan_ratios[last(pass_indices)]
+    end
 
+    # 4. 接空間角摂動ロバスト性評価
     angles_deg = collect(range(0.0, 60.0, length=21))
     mc_robustness = zeros(Float64, length(angles_deg))
     n_trials = 100
@@ -168,7 +194,7 @@ function run_phase4_highdim()
         sin_rad = sin(rad)
         cap_count = Threads.Atomic{Int}(0)
 
-        Threads.@threads for _ in 1:n_trials
+        Threads.@threads :static for _ in 1:n_trials
             ws = workspaces[clamp(Threads.threadid(), 1, length(workspaces))]
             randn!(ws.r)
             project_tangent!(ws.v, ws.r, mu0, D)
@@ -255,7 +281,7 @@ function run_degeneracy_test(n_trials::Int=2000)
         phi_init = mu_local / R
         sin_phi, cos_phi = sin(phi_init), cos(phi_init)
 
-        Threads.@threads for _ in 1:n_trials
+        Threads.@threads :static for _ in 1:n_trials
             tid = clamp(Threads.threadid(), 1, n_alloc)
             gb = ws_g[tid]; fb = ws_f[tid]
             m = ws_m[tid]; p_v = ws_p[tid]
@@ -292,7 +318,6 @@ function export_publication_pdf_vertical(filename::String, scan_ratios, scan_xi,
                                          angles_deg, mc_robustness,
                                          p0_range, pc_1, pc_2, p_lo, p_hi,
                                          w_lo, w_hi)
-    # 先行論文のプロポーション (約 1 : 1.2) に完全整合させたキャンバス設計
     fig = Figure(size = (520, 620), backgroundcolor = :white, figure_padding = (15, 20, 10, 12))
 
     common_axis = (
@@ -316,9 +341,7 @@ function export_publication_pdf_vertical(filename::String, scan_ratios, scan_xi,
         titlealign = :left
     )
 
-    # ----------------------------------------------------
     # (a) Separatrix Traversal Window
-    # ----------------------------------------------------
     ax_a = Axis(fig[1, 1];
         title = L"\textbf{(a) Separatrix Traversal Window } (D = 2048)",
         xlabel = L"P_0 / P_0^*",
@@ -330,24 +353,19 @@ function export_publication_pdf_vertical(filename::String, scan_ratios, scan_xi,
     xlims!(ax_a, 0.0, 2.5)
     ylims!(ax_a, -1.05, 1.05)
 
-    # 背景カラーバンド
     vspan!(ax_a, [0.0], [w_lo]; color = (:crimson, 0.05))
     vspan!(ax_a, [w_lo], [w_hi]; color = (:seagreen, 0.10))
     vspan!(ax_a, [w_hi], [2.5]; color = (:crimson, 0.05))
 
-    # 領域アノテーション
     text!(ax_a, 0.40, -0.80; text = "Trapped", fontsize = 8.5, color = :gray40, align = (:center, :center))
     text!(ax_a, (w_lo + w_hi)/2, -0.80; text = "Safe Capture", fontsize = 9.0, color = :seagreen4, align = (:center, :center))
     text!(ax_a, 2.15, -0.80; text = "Overshoot", fontsize = 8.5, color = :gray40, align = (:center, :center))
 
-    # 境界破線 & 基準線
     vlines!(ax_a, [w_lo, w_hi]; color = :seagreen, linestyle = :dash, linewidth = 1.1)
     hlines!(ax_a, [0.0]; color = (:black, 0.25), linestyle = :dash, linewidth = 0.8)
     lines!(ax_a, scan_ratios, scan_xi; color = :crimson, linewidth = 2.0)
 
-    # ----------------------------------------------------
     # (b) Tangent Perturbation Robustness
-    # ----------------------------------------------------
     ax_b = Axis(fig[2, 1];
         title = L"\textbf{(b) Tangent Perturbation Robustness } (D = 2048)",
         xlabel = L"\text{Perturbation Angle }\theta\ [\mathrm{deg}]",
@@ -368,9 +386,7 @@ function export_publication_pdf_vertical(filename::String, scan_ratios, scan_xi,
     lines!(ax_b, angles_deg, mc_robustness; color = :darkgoldenrod, linewidth = 1.8)
     scatter!(ax_b, angles_deg, mc_robustness; color = :darkgoldenrod, markersize = 5.5)
 
-    # ----------------------------------------------------
     # (c) Symplectic Degeneracy Proof
-    # ----------------------------------------------------
     p_max = p0_range[end]
     ax_c = Axis(fig[3, 1];
         title = L"\textbf{(c) Symplectic Degeneracy Proof } (\mathbb{S}^1 \to \text{1D})",
@@ -414,9 +430,9 @@ function main()
     @printf("  Max Momentum Residual            : %.2e\n", dev_p)
     @printf("  Max Monte Carlo Residual         : %.2e\n\n", max_mc_diff)
 
-    pdf_out = "inertial_bypass_simulation.pdf"
+    pdf_out = "inertial-bypass-simulation.pdf"
     export_publication_pdf_vertical(pdf_out, scan_ratios, scan_xi, angles_deg, mc_robustness, p0_r, pc1, pc2, p_lo, p_hi, w_lo, w_hi)
-    println("Output: ", pdf_out)
+    println("Publication PDF generated: ", pdf_out)
 end
 
 Base.invokelatest(main)
